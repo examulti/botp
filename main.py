@@ -18,7 +18,6 @@ import json
 import random
 import base64
 import asyncio
-import xml.etree.ElementTree as ET
 from typing import Optional
 
 import aiohttp
@@ -30,8 +29,20 @@ from discord.ext import commands, tasks
 # ---------------- CONFIG (desde variables de entorno) ----------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-PINTEREST_USER = os.environ["PINTEREST_USER"]  # solo el usuario, ej: fr6652558
-BOARD_SLUG = os.environ["PINTEREST_BOARD"]  # solo el tablero, ej: randoms
+
+
+def _slug(value: str, last: bool) -> str:
+    """Acepta 'randoms' o la URL completa y se queda solo con el nombre."""
+    value = re.sub(r"^https?://", "", value.strip())
+    value = re.sub(r"^(?:[a-z]{2,3}\.|www\.)?pinterest\.[a-z.]+/", "", value)
+    parts = [x for x in value.split("?")[0].split("/") if x]
+    if not parts:
+        return value
+    return re.sub(r"\.rss$", "", parts[-1] if last else parts[0])
+
+
+PINTEREST_USER = _slug(os.environ["PINTEREST_USER"], last=False)  # ej: fr6652558
+BOARD_SLUG = _slug(os.environ["PINTEREST_BOARD"], last=True)  # ej: randoms
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "30"))  # foto extra aleatoria por canal
 CHECK_MINUTES = int(os.environ.get("CHECK_MINUTES", "5"))  # cada cuánto busca fotos nuevas en el tablero
@@ -76,6 +87,13 @@ state.setdefault("classified", {})  # url -> categoría
 state.setdefault("seen", {})  # id de canal -> fotos ya enviadas
 
 URL_RE = re.compile(r"https://i\.pinimg\.com/\S+")
+IMG_RE = re.compile(r"https://i\.pinimg\.com/(?:\d{3,4}x|originals)/[^\s\"'<>&)\]]+")
+last_report: list[str] = []  # lo que pasó en la última revisión (lo muestra /revisar)
+
+
+def log(msg: str):
+    print(msg)
+    last_report.append(msg)
 post_lock = asyncio.Lock()  # evita que dos envíos simultáneos elijan la misma foto
 classify_lock = asyncio.Lock()  # evita revisar el tablero dos veces a la vez
 
@@ -119,20 +137,43 @@ bot = PinBot(command_prefix="!", intents=discord.Intents.default())
 
 # ---------------- Pinterest + Gemini ----------------
 async def fetch_pins(session: aiohttp.ClientSession) -> list[str]:
-    """Lee el RSS público del tablero. Devuelve URLs (tamaño 736x)."""
+    """Lee el RSS público del tablero. Devuelve URLs (tamaño 736x), de la más nueva a la más vieja."""
     url = f"https://www.pinterest.com/{PINTEREST_USER}/{BOARD_SLUG}.rss"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        if r.status != 200:
-            print(f"[!] RSS {url} -> {r.status}")
-            return []
-        xml = await r.text()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
+    async with session.get(url, headers=headers) as r:
+        status = r.status
+        ctype = r.headers.get("Content-Type", "")
+        text = await r.text(errors="replace")
 
-    pins = []
-    for item in ET.fromstring(xml).iter("item"):
-        desc = item.findtext("description") or ""
-        m = re.search(r'src="(https://i\.pinimg\.com/[^"]+)"', desc)
-        if m:
-            pins.append(re.sub(r"/\d+x/", "/736x/", m.group(1)))
+    if status != 200:
+        hint = {
+            404: "El tablero no existe o es privado. Revisa PINTEREST_USER y PINTEREST_BOARD, y que el tablero sea público.",
+            403: "Pinterest está bloqueando la IP de Render.",
+            429: "Pinterest está limitando las peticiones desde Render.",
+        }.get(status, "")
+        log(f"[!] RSS respondió {status} en {url}\n{hint}".strip())
+        return []
+
+    if "<item" not in text:
+        log(f"[!] La respuesta no es un RSS con fotos ({ctype}). Empieza así: {text[:120]!r}")
+        return []
+
+    pins, keys = [], set()
+    for item in re.findall(r"<item\b.*?</item>", text, re.S):
+        m = IMG_RE.search(item)
+        if not m:
+            continue
+        key = pin_key(m.group(0))
+        if key in keys:
+            continue
+        keys.add(key)
+        pins.append(re.sub(r"/(?:\d+x|originals)/", "/736x/", m.group(0)))
+
+    log(f"Tablero: {len(pins)} fotos encontradas ({PINTEREST_USER}/{BOARD_SLUG})")
     return pins
 
 
@@ -140,6 +181,7 @@ async def classify(session: aiohttp.ClientSession, img_url: str) -> str | None:
     """Pregunta a Gemini a qué categoría pertenece la imagen."""
     async with session.get(img_url) as r:
         if r.status != 200:
+            log(f"[!] No pude descargar la foto ({r.status}): {img_url}")
             return None
         data = await r.read()
         mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
@@ -159,7 +201,13 @@ async def classify(session: aiohttp.ClientSession, img_url: str) -> str | None:
         if r.status == 429:
             raise RateLimited()
         if r.status != 200:
-            print(f"[!] Gemini -> {r.status}: {(await r.text())[:200]}")
+            hint = {
+                400: "Revisa que GEMINI_API_KEY sea válida.",
+                401: "GEMINI_API_KEY no es válida.",
+                403: "GEMINI_API_KEY no tiene permiso o es inválida.",
+                404: f"El modelo '{GEMINI_MODEL}' no existe: cambia GEMINI_MODEL en Render.",
+            }.get(r.status, "")
+            log(f"[!] Gemini respondió {r.status}. {hint} {(await r.text())[:150]}")
             return None
         j = await r.json()
 
@@ -176,49 +224,74 @@ async def classify(session: aiohttp.ClientSession, img_url: str) -> str | None:
     return "unknown"
 
 
-async def process_new_pins() -> int:
+async def process_new_pins():
     """
-    Revisa el tablero: clasifica las fotos nuevas con Gemini y las manda
-    al instante al canal de su categoría. Devuelve cuántas procesó.
+    Revisa el tablero: clasifica las fotos nuevas con Gemini y manda al canal
+    de su categoría toda foto del tablero que todavía no haya salido ahí.
+    El resultado queda en last_report.
     """
-    done = 0
     async with classify_lock:
+        last_report.clear()
         async with aiohttp.ClientSession() as session:
             pins = await fetch_pins(session)
+            if not pins:
+                return
             new = [p for p in pins if p not in state["classified"]]
+            done = fails = 0
             for pin in reversed(new[:MAX_CLASSIFY_PER_CYCLE]):  # de la más vieja a la más nueva
                 try:
                     cat = await classify(session, pin)
                 except RateLimited:
-                    print("[!] Límite gratis de Gemini alcanzado, sigo en la próxima revisión")
+                    log("[!] Límite gratis de Gemini alcanzado, sigo en la próxima revisión")
                     break
                 if cat:
                     state["classified"][pin] = cat
                     save_state()
-                    await deliver_pin(pin, cat)
                     done += 1
+                else:
+                    fails += 1
+                    if fails >= 3:
+                        log("[!] Falló la clasificación 3 veces seguidas, paro hasta la próxima revisión")
+                        break
                 await asyncio.sleep(SECONDS_BETWEEN_CALLS)
-    return done
+            log(f"Fotos nuevas: {len(new)} · clasificadas ahora: {done}")
+
+        warned: set = set()
+        sent = 0
+        for pin in reversed(pins):
+            if sent >= MAX_CLASSIFY_PER_CYCLE:
+                break
+            cat = state["classified"].get(pin)
+            if cat:
+                sent += await deliver_pin(pin, cat, warned)
+        log(f"Enviadas a canales: {sent}")
 
 
-async def deliver_pin(pin: str, cat: str):
-    """Manda una foto recién clasificada al canal de su categoría en cada servidor."""
+async def deliver_pin(pin: str, cat: str, warned: set) -> int:
+    """Manda la foto al canal de su categoría en cada servidor. Devuelve cuántas veces la mandó."""
     channel_name = CATEGORY_TO_CHANNEL.get(cat)
     if not channel_name:  # categoría "unknown": no hay canal para ella
-        return
+        return 0
+    sent = 0
     for guild in bot.guilds:
         channel = discord.utils.get(guild.text_channels, name=channel_name)
         if not channel:
+            if (guild.id, channel_name) not in warned:
+                warned.add((guild.id, channel_name))
+                log(f"[!] No existe el canal #{channel_name} en {guild.name}")
             continue
         perms = channel.permissions_for(guild.me)
         if not (perms.view_channel and perms.send_messages):
-            print(f"[!] Sin permiso para escribir en #{channel.name} ({guild.name})")
+            if (guild.id, channel_name) not in warned:
+                warned.add((guild.id, channel_name))
+                log(f"[!] Sin permiso para escribir en #{channel.name}")
             continue
         try:
             if await send_pin(channel, pin):
-                print(f"Foto nueva -> #{channel.name} ({guild.name})")
+                sent += 1
         except Exception as e:
-            print(f"[!] Error mandando a #{channel.name}: {e}")
+            log(f"[!] Error mandando a #{channel.name}: {e}")
+    return sent
 
 
 # ---------------- Envío de fotos sin repetir ----------------
@@ -371,7 +444,7 @@ async def stats(interaction: discord.Interaction):
     for c in state["classified"].values():
         counts[c] = counts.get(c, 0) + 1
     if not counts:
-        return await interaction.response.send_message("Aún no hay fotos clasificadas.", ephemeral=True)
+        return await interaction.response.send_message("Aún no hay fotos clasificadas. Usa /revisar para ver qué pasa.", ephemeral=True)
 
     lines = []
     for cat, total in sorted(counts.items()):
@@ -383,19 +456,16 @@ async def stats(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="revisar", description="Revisa ahora el tablero y manda las fotos nuevas a sus canales")
+@bot.tree.command(name="revisar", description="Revisa ahora el tablero y muestra qué pasó")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def revisar(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        n = await process_new_pins()
+        await process_new_pins()
     except Exception as e:
         return await interaction.followup.send(f"❌ Error revisando el tablero: {e}")
-    if n:
-        await interaction.followup.send(f"✅ {n} foto(s) nueva(s) procesadas.")
-    else:
-        await interaction.followup.send("No hay fotos nuevas en el tablero.")
+    await interaction.followup.send(("\n".join(last_report) or "Sin novedades.")[:1900])
 
 
 # ---------------- Eventos ----------------
@@ -416,6 +486,7 @@ ready_done = False
 async def on_ready():
     global ready_done
     print(f"Conectado como {bot.user}")
+    print(f"Tablero: https://www.pinterest.com/{PINTEREST_USER}/{BOARD_SLUG}.rss")
     if ready_done:  # on_ready puede dispararse más de una vez al reconectar
         return
     ready_done = True
