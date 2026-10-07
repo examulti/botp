@@ -2,7 +2,7 @@
 Bot de Discord + Pinterest + Gemini, listo para Render.
 
 - Lee UN tablero público de Pinterest (RSS)
-- Gemini (gratis) clasifica cada foto
+- Clasifica cada foto por reglas (tamaño + palabras del pin) y, si quieres, con Gemini
 - La manda al canal que le corresponde (sin repetir)
 - Vigila el tablero: cada foto nueva se clasifica y se manda sola a su canal
 - Comandos slash: /pfp, /stats y /revisar
@@ -10,11 +10,13 @@ Bot de Discord + Pinterest + Gemini, listo para Render.
 
 Variables de entorno (se ponen en Render, NO en el código):
   DISCORD_TOKEN, GEMINI_API_KEY, PINTEREST_USER, PINTEREST_BOARD
-  Opcionales: GEMINI_MODEL, INTERVAL_MINUTES, CHECK_MINUTES,
+  Opcionales: CLASSIFIER (rules = sin IA, auto = reglas + IA, ai = solo IA), GEMINI_MODEL,
+  INTERVAL_MINUTES, CHECK_MINUTES,
   MAX_CLASSIFY_PER_CYCLE, SECONDS_BETWEEN_CALLS, MAX_SEND_PER_CYCLE
 """
 import os
 import re
+import html
 import json
 import random
 import base64
@@ -29,7 +31,8 @@ from discord.ext import commands, tasks
 
 # ---------------- CONFIG (desde variables de entorno) ----------------
 TOKEN = os.environ["DISCORD_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")  # solo hace falta si CLASSIFIER es auto o ai
+CLASSIFIER = os.environ.get("CLASSIFIER", "rules").strip().lower()  # rules | auto | ai
 
 
 def _slug(value: str, last: bool) -> str:
@@ -91,6 +94,7 @@ state.setdefault("seen", {})  # id de canal -> fotos ya enviadas
 
 URL_RE = re.compile(r"https://i\.pinimg\.com/\S+")
 IMG_RE = re.compile(r"https://i\.pinimg\.com/(?:\d{3,4}x|originals)/[^\s\"'<>&)\]]+")
+pin_meta: dict[str, dict] = {}  # url -> {"w", "h", "text"} del pin (para clasificar sin IA)
 last_report: list[str] = []  # lo que pasó en la última revisión (lo muestra /revisar)
 
 
@@ -181,7 +185,11 @@ async def fetch_pins_rss(session: aiohttp.ClientSession) -> list[str]:
         if key in keys:
             continue
         keys.add(key)
-        pins.append(re.sub(r"/(?:\d+x|originals)/", "/736x/", m.group(0)))
+        pin_url = re.sub(r"/(?:\d+x|originals)/", "/736x/", m.group(0))
+        pins.append(pin_url)
+        txt = html.unescape(html.unescape(item))
+        txt = re.sub(r"https?://\S+", " ", re.sub(r"<[^>]+>", " ", txt))
+        pin_meta[pin_url] = {"w": None, "h": None, "text": txt.lower()}
 
     log(f"Tablero: {len(pins)} fotos encontradas ({PINTEREST_USER}/{BOARD_SLUG})")
     return pins
@@ -247,7 +255,19 @@ async def fetch_pins_api(session: aiohttp.ClientSession) -> list[str]:
             if key in keys:
                 continue
             keys.add(key)
-            pins.append(re.sub(r"/(?:\d+x|originals)/", "/736x/", m.group(0)))
+            pin_url = re.sub(r"/(?:\d+x|originals)/", "/736x/", m.group(0))
+            pins.append(pin_url)
+            w = h = None
+            for size in ("736x", "orig"):
+                im = images.get(size) or {}
+                if im.get("width") and im.get("height"):
+                    w, h = im["width"], im["height"]
+                    break
+            text = " ".join(
+                str(pin.get(k) or "")
+                for k in ("title", "grid_title", "description", "auto_alt_text", "seo_alt_text")
+            )
+            pin_meta[pin_url] = {"w": w, "h": h, "text": text.lower()}
         bookmark = rr.get("bookmark") or (j.get("resource", {}).get("options", {}).get("bookmarks") or [None])[0]
         if not data or not bookmark or bookmark == "-end-":
             break
@@ -265,6 +285,57 @@ async def fetch_pins(session: aiohttp.ClientSession) -> list[str]:
     except Exception as e:
         log(f"[!] No pude leer el tablero completo ({e}), uso el RSS (solo las más recientes)")
     return await fetch_pins_rss(session)
+
+
+KEYWORDS = [  # en orden de prioridad: la primera categoría que coincida gana
+    ("banner", [r"banners?", r"headers?"]),
+    ("wallpaper", [r"wallpapers?", r"lock ?screen", r"fondo de pantalla", r"backgrounds?"]),
+    ("egirl", [r"e-?girls?", r"e-?boys?", r"gamer girl", r"alt girl", r"scene ?(?:kid|girl|queen)"]),
+    ("edgy", [r"edgy", r"goth(?:ic)?", r"emo", r"grunge", r"punk", r"dark", r"skulls?", r"horror", r"villain", r"gore", r"blood"]),
+    ("anime", [r"anime", r"manga", r"waifu", r"genshin", r"naruto", r"jujutsu", r"chainsaw man", r"demon slayer", r"one piece", r"fanart", r"chibi", r"vtuber", r"ghibli"]),
+    ("soft", [r"soft", r"pastel", r"cute", r"kawaii", r"coquette", r"cottagecore", r"dreamy", r"angelcore", r"fairycore", r"pink"]),
+    ("pfp", [r"pfps?", r"profile pic(?:ture)?s?", r"avatars?", r"icons?", r"matching"]),
+]
+KEYWORD_RES = [(c, re.compile(r"\b(?:" + "|".join(w) + r")\b")) for c, w in KEYWORDS]
+
+
+def classify_rules(pin: str) -> tuple[str, bool]:
+    """
+    Clasifica sin IA: primero por las palabras del pin (título, descripción, alt)
+    y, si no hay ninguna, por la forma de la imagen.
+    Devuelve (categoría, segura). 'segura' es True solo si coincidió una palabra.
+    """
+    meta = pin_meta.get(pin, {})
+    text = meta.get("text", "")
+    for cat, rx in KEYWORD_RES:
+        if rx.search(text):
+            return cat, True
+    w, h = meta.get("w"), meta.get("h")
+    if w and h:
+        ratio = w / h
+        if ratio >= 1.5:
+            return "banner", False  # horizontal y ancha
+        if ratio <= 0.6:
+            return "wallpaper", False  # muy vertical, tipo pantalla de celular
+    return "pfp", False
+
+
+async def classify_pin(session: aiohttp.ClientSession, pin: str) -> tuple[Optional[str], bool]:
+    """Elige la categoría según CLASSIFIER. Devuelve (categoría, usó_IA)."""
+    rule_cat, confident = classify_rules(pin)
+    if CLASSIFIER == "rules" or not GEMINI_KEY:
+        return rule_cat, False
+    if CLASSIFIER == "auto" and confident:
+        return rule_cat, False
+    try:
+        cat = await classify(session, pin)
+    except RateLimited:
+        if CLASSIFIER == "auto":
+            return rule_cat, False  # sin IA disponible: no se frena, usa las reglas
+        raise
+    if cat is None and CLASSIFIER == "auto":
+        return rule_cat, False
+    return cat, True
 
 
 async def classify(session: aiohttp.ClientSession, img_url: str) -> str | None:
@@ -330,9 +401,10 @@ async def process_new_pins() -> bool:
             new = [p for p in pins if p not in state["classified"]]
             done = fails = 0
             stopped = False
-            for pin in reversed(new[:MAX_CLASSIFY_PER_CYCLE]):  # de la más vieja a la más nueva
+            limit = len(new) if CLASSIFIER == "rules" else MAX_CLASSIFY_PER_CYCLE
+            for pin in reversed(new[:limit]):  # de la más vieja a la más nueva
                 try:
-                    cat = await classify(session, pin)
+                    cat, used_ai = await classify_pin(session, pin)
                 except RateLimited:
                     log("[!] Límite gratis de Gemini alcanzado, sigo en la próxima revisión")
                     stopped = True
@@ -347,9 +419,10 @@ async def process_new_pins() -> bool:
                         log("[!] Falló la clasificación 3 veces seguidas, paro hasta la próxima revisión")
                         stopped = True
                         break
-                await asyncio.sleep(SECONDS_BETWEEN_CALLS)
+                if used_ai:
+                    await asyncio.sleep(SECONDS_BETWEEN_CALLS)
             log(f"Fotos nuevas: {len(new)} · clasificadas ahora: {done}")
-            more = len(new) > MAX_CLASSIFY_PER_CYCLE and done > 0 and not stopped
+            more = len(new) > limit and done > 0 and not stopped
 
         warned: set = set()
         sent = 0
@@ -360,7 +433,7 @@ async def process_new_pins() -> bool:
             if cat:
                 sent += await deliver_pin(pin, cat, warned)
         log(f"Enviadas a canales: {sent}")
-        return more
+        return more or sent >= MAX_SEND_PER_CYCLE
 
 
 async def deliver_pin(pin: str, cat: str, warned: set) -> int:
@@ -487,6 +560,7 @@ async def watch_board():
         for _ in range(20):  # si quedan fotos por clasificar, sigue sin esperar al próximo turno
             if not await process_new_pins():
                 break
+            await asyncio.sleep(5)
     except Exception as e:
         print(f"[!] Error revisando el tablero: {e}")
 
@@ -568,6 +642,9 @@ async def stats(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def revisar(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    if classify_lock.locked():
+        msg = "⏳ Ya hay una revisión en curso. Esto va hasta ahora:\n" + ("\n".join(last_report) or "Sin novedades todavía.")
+        return await interaction.followup.send(msg[:1900])
     try:
         await process_new_pins()
     except Exception as e:
@@ -594,6 +671,7 @@ async def on_ready():
     global ready_done
     print(f"Conectado como {bot.user}")
     print(f"Tablero: https://www.pinterest.com/{PINTEREST_USER}/{BOARD_SLUG}.rss")
+    print(f"Clasificador: {CLASSIFIER}")
     if ready_done:  # on_ready puede dispararse más de una vez al reconectar
         return
     ready_done = True
