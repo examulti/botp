@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: pinterest-discord-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PINTEREST_USER
+        sync: false
+      - key: PINTEREST_BOARD
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: INTERVAL_MINUTES
+        value: "30"
